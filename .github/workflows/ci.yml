@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: swift test (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      # The contract fixtures live in the lever monorepo, pinned by SHA.
+      # Bumping .contract-fixtures-sha is the contract-sync act (spec §1).
+      - name: Check out the pinned contract fixtures
+        uses: actions/checkout@v7
+        with:
+          repository: ForceTower/lever
+          path: .contract-fixtures-repo
+          fetch-depth: 0
+
+      - name: Pin the fixtures to the recorded SHA
+        run: |
+          set -euo pipefail
+          sha="$(tr -d '[:space:]' < .contract-fixtures-sha)"
+          git -C .contract-fixtures-repo checkout --quiet "$sha"
+          dir=".contract-fixtures-repo/packages/contract-fixtures/fixtures/http"
+          count="$(find "$dir" -name '*.json' | wc -l | tr -d ' ')"
+          if [ "$count" -lt 6 ]; then
+            echo "expected at least 6 http fixtures, found $count" >&2
+            exit 1
+          fi
+          echo "LEVER_CONTRACT_FIXTURES=$GITHUB_WORKSPACE/$dir" >> "$GITHUB_ENV"
+
+      - run: swift test
+
+  simulator:
+    name: ${{ matrix.platform }}
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: iOS
+            destination: platform=iOS Simulator,name=iPhone 16
+            action: test
+          - platform: watchOS
+            destination: platform=watchOS Simulator,name=Apple Watch Series 10 (46mm)
+            action: build
+          - platform: tvOS
+            destination: platform=tvOS Simulator,name=Apple TV
+            action: build
+          - platform: visionOS
+            destination: platform=visionOS Simulator,name=Apple Vision Pro
+            action: build
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - run: |
+          xcodebuild ${{ matrix.action }} \
+            -scheme Lever \
+            -destination '${{ matrix.destination }}' \
+            -quiet
+
+  consumers:
+    name: consumer isolation fixtures
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      # Building Lever proves nothing about the consumption promise: these two
+      # targets compile the same LeverKeys extension and dynamic-member read
+      # under MainActor-default and nonisolated-default isolation (spec §1).
+      - run: swift build --package-path Fixtures/ConsumerFixtures
