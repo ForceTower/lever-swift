@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 /// Everything asynchronous the SDK does: scheduling, lifecycle reaction, the
 /// SSE connection, and fetch execution — every `Task` and timer, so
@@ -21,8 +22,18 @@ actor LeverRuntime {
     private let clock: any LeverClock
     private var sink: any LeverLogSink { configuration.logSink }
 
-    private weak var client: LeverClient?
-    private var clientId = ""
+    /// Set synchronously by `start`, not on the actor: an explicit `fetch()`
+    /// issued on the line after `init` must not race the runtime's first hop
+    /// and silently find no client. Weak, so the runtime's tasks can never keep
+    /// a released client alive (§4.1).
+    private struct ClientRef: Sendable {
+        weak var client: LeverClient?
+        var clientId = ""
+    }
+
+    private let clientRef = Mutex(ClientRef())
+    private nonisolated var client: LeverClient? { clientRef.withLock { $0.client } }
+    private nonisolated var clientId: String { clientRef.withLock { $0.clientId } }
 
     private var inFlight: Task<Void, any Error>?
     private var timer: Task<Void, Never>?
@@ -54,13 +65,11 @@ actor LeverRuntime {
     // MARK: - Lifetime
 
     nonisolated func start(client: LeverClient) {
-        Task { await self.begin(client: client) }
+        clientRef.withLock { $0 = ClientRef(client: client, clientId: client.clientId) }
+        Task { await self.begin() }
     }
 
-    private func begin(client: LeverClient) {
-        self.client = client
-        clientId = client.clientId
-
+    private func begin() {
         // Cache-only reader: reads and explicit fetches still work, but nothing
         // here starts — no fetch, timer, lifecycle observer, or stream (§5).
         guard configuration.automaticUpdates else { return }

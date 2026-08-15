@@ -412,6 +412,29 @@ final class TestHarness: Sendable {
         return LeverClient(configuration: configuration, environment: environment)
     }
 
+    /// Writes a snapshot where a client with this configuration will find it.
+    @discardableResult
+    func seedCache(
+        version: Int,
+        _ values: [String: WireValue],
+        etag: String? = nil,
+        fetchedAt: Int? = nil,
+        clientKey: String = "pk_test",
+        namespace: String? = nil
+    ) -> CacheStore {
+        let store = cacheStore(clientKey: clientKey, namespace: namespace)
+        store.save(
+            CachedSnapshot(
+                version: version,
+                etag: etag,
+                values: values,
+                fetchedAt: fetchedAt ?? now,
+                activatedAt: fetchedAt ?? now
+            )
+        )
+        return store
+    }
+
     /// The cache files a client with this configuration reads and writes.
     func cacheStore(clientKey: String = "pk_test", namespace: String? = nil) -> CacheStore {
         var configuration = self.configuration(clientKey: clientKey)
