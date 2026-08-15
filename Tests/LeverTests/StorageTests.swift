@@ -46,22 +46,74 @@ struct CacheStoreTests {
         #expect(store(harness, keyHash: "bbbbbbbbbbbbbbbb").loadOrCreateClientId() == original)
     }
 
-    @Test("a corrupt or overlong client id regenerates with a warning")
-    func regeneratesBrokenIdentity() throws {
+    @Test("an unreadable identity file regenerates with a warning")
+    func regeneratesUnreadableIdentity() throws {
         let harness = TestHarness()
         let cache = store(harness)
         _ = cache.loadOrCreateClientId()
 
         try Data("not json".utf8).write(to: cache.identityURL)
-        let regenerated = cache.loadOrCreateClientId()
-        #expect(UUID(uuidString: regenerated) != nil)
+        #expect(UUID(uuidString: cache.loadOrCreateClientId()) != nil)
         #expect(harness.sink.contains(.warn, "identity file is unreadable"))
+    }
 
-        let overlong = String(repeating: "x", count: 65)
-        try Data("{\"schemaVersion\":1,\"clientId\":\"\(overlong)\"}".utf8)
+    @Test("a structurally valid identity that is not a uuid regenerates")
+    func rejectsNonUUIDIdentity() throws {
+        for stored in ["x", String(repeating: "a", count: 65), "6f9a1c2b3d4e4f5a8b9c0d1e2f3a4b5c"] {
+            let harness = TestHarness()
+            let cache = store(harness)
+            try FileManager.default.createDirectory(
+                at: cache.directory,
+                withIntermediateDirectories: true
+            )
+            try Data("{\"schemaVersion\":1,\"clientId\":\"\(stored)\"}".utf8)
+                .write(to: cache.identityURL)
+
+            let loaded = cache.loadOrCreateClientId()
+            #expect(loaded != stored)
+            #expect(UUID(uuidString: loaded) != nil)
+            #expect(harness.sink.contains(.warn, "client id is not a uuid"))
+        }
+    }
+
+    @Test("an uppercase uuid keeps its identity and is rewritten lowercase")
+    func normalizesUppercaseIdentity() throws {
+        let harness = TestHarness()
+        let cache = store(harness)
+        let uuid = UUID()
+        try FileManager.default.createDirectory(
+            at: cache.directory,
+            withIntermediateDirectories: true
+        )
+        try Data("{\"schemaVersion\":1,\"clientId\":\"\(uuid.uuidString)\"}".utf8)
             .write(to: cache.identityURL)
-        #expect(cache.loadOrCreateClientId() != overlong)
-        #expect(harness.sink.contains(.warn, "client id is out of range"))
+
+        // Regenerating here would reshuffle the rollout bucketing key over a
+        // difference in spelling, and two SDKs sharing a directory would fight
+        // forever. The identity is kept; the file is canonicalized.
+        let loaded = cache.loadOrCreateClientId()
+        #expect(loaded == uuid.uuidString.lowercased())
+        #expect(harness.sink.contains(.warn, "client id was not canonical"))
+        #expect(cache.loadOrCreateClientId() == loaded)
+    }
+
+    @Test("out-of-range timestamps are corrupt, not a scheduling input")
+    func rejectsOutOfRangeTimestamps() throws {
+        let harness = TestHarness()
+        let cache = store(harness)
+        try FileManager.default.createDirectory(
+            at: cache.directory,
+            withIntermediateDirectories: true
+        )
+        try Data(
+            """
+            {"schemaVersion":1,"version":1,"etag":null,"values":{},\
+            "fetchedAt":\(Int.min),"activatedAt":0}
+            """.utf8
+        ).write(to: cache.snapshotURL)
+
+        #expect(cache.loadSnapshot() == nil)
+        #expect(harness.sink.contains(.warn, "cache file timestamps are out of range"))
     }
 
     @Test("concurrent first initializations converge on one identity")
@@ -232,5 +284,71 @@ struct CacheStoreTests {
         #expect(
             pinned != cacheKeyHash(baseURL: URL(string: "https://other.example")!, namespace: "prod")
         )
+    }
+}
+
+
+@Suite("snapshot write ordering (§7)")
+struct SnapshotWriterTests {
+    private func snapshot(version: Int) -> CachedSnapshot {
+        CachedSnapshot(
+            version: version,
+            etag: "\"v\(version)\"",
+            values: [:],
+            fetchedAt: 1_755_100_000,
+            activatedAt: 1_755_100_000
+        )
+    }
+
+    @Test("a delayed write from an older commit cannot regress the file")
+    func obsoleteWriteIsDropped() {
+        let harness = TestHarness()
+        let store = harness.cacheStore()
+        let writer = SnapshotWriter(store: store)
+
+        // Commit 2 reaches the disk first; commit 1 was preempted between
+        // releasing the state lock and writing. Memory serves 3, and without
+        // ordering the next launch would restore 2.
+        writer.write(snapshot(version: 3), sequence: 2)
+        writer.write(snapshot(version: 2), sequence: 1)
+
+        #expect(store.loadSnapshot()?.version == 3)
+    }
+
+    @Test("writes in commit order all land")
+    func orderedWritesLand() {
+        let harness = TestHarness()
+        let store = harness.cacheStore()
+        let writer = SnapshotWriter(store: store)
+
+        writer.write(snapshot(version: 1), sequence: 1)
+        #expect(store.loadSnapshot()?.version == 1)
+        writer.write(snapshot(version: 2), sequence: 2)
+        #expect(store.loadSnapshot()?.version == 2)
+    }
+
+    @Test("concurrent activations leave the file agreeing with memory")
+    func concurrentActivationsConverge() async throws {
+        let harness = TestHarness()
+        let client = harness.makeClient { $0.automaticUpdates = false }
+
+        for version in 1...40 {
+            client.stage(
+                Representation(
+                    version: version,
+                    values: ["flag": WireValue(type: "boolean", value: .bool(version.isMultiple(of: 2)))],
+                    etag: "\"v\(version)\"",
+                    fetchedAt: 1_755_100_000,
+                    activatedAt: nil
+                )
+            )
+            await withTaskGroup(of: Void.self) { group in
+                for _ in 0..<4 {
+                    group.addTask { client.activate() }
+                }
+            }
+        }
+
+        #expect(harness.cacheStore().loadSnapshot()?.version == client.activatedVersion)
     }
 }

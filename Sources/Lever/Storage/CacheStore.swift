@@ -66,10 +66,20 @@ struct CacheStore: Sendable {
             sink.warn("identity file is unreadable — regenerating the client id")
             return nil
         }
-        // Spec 0001 §6.2 caps clientId at 64 chars; an overlong one would 400.
-        guard !file.clientId.isEmpty, file.clientId.utf16.count <= 64 else {
-            sink.warn("client id is out of range — regenerating")
+        // §7 defines the persisted identity as a lowercase UUID, and spec 0001
+        // §6.2 caps clientId at 64 chars, so anything unparseable is corrupt.
+        guard let uuid = UUID(uuidString: file.clientId) else {
+            sink.warn("client id is not a uuid — regenerating")
             return nil
+        }
+        let canonical = uuid.uuidString.lowercased()
+        guard canonical == file.clientId else {
+            // Same installation, wrong spelling. Rewriting beats regenerating:
+            // the client id is the rollout bucketing key, and two SDKs sharing
+            // a cache directory that each regenerated on the other's casing
+            // would reshuffle every percentage rollout forever.
+            sink.warn("client id was not canonical — rewriting it lowercase")
+            return overwriteIdentity(canonical)
         }
         return file.clientId
     }
@@ -99,6 +109,13 @@ struct CacheStore: Sendable {
         }
         guard file.version >= 0 else {
             sink.warn("cache file version is negative — treating as a first run")
+            return nil
+        }
+        // Unix seconds are non-negative. Letting a negative one through would
+        // reach the scheduler's elapsed-time arithmetic and trap, turning a
+        // corrupt cache into a crash — the one thing the floor forbids (§10.1).
+        guard file.fetchedAt >= 0, file.activatedAt >= 0 else {
+            sink.warn("cache file timestamps are out of range — treating as a first run")
             return nil
         }
         return CachedSnapshot(

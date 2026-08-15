@@ -84,6 +84,58 @@ struct ServerSentEventParserTests {
         }
     }
 
+    @Test(
+        "the bound covers every field kind, not just the incomplete tail",
+        arguments: ["event: ", "data: ", ": ", "retry: ", "whatever: "]
+    )
+    func boundCoversEveryFieldKind(prefix: String) {
+        var parser = ServerSentEventParser()
+        // Terminated, so a check that only looked at what was left over after
+        // consuming the chunk would find nothing wrong — after allocating it.
+        let line = prefix + String(repeating: "x", count: ServerSentEventParser.maxFrameBytes) + "\n"
+        #expect(throws: ServerSentEventParser.ParseError.frameTooLarge) {
+            _ = try parser.consume(Array(line.utf8))
+        }
+    }
+
+    @Test("many small fields that together exceed the bound still error")
+    func boundIsPerFrameNotPerLine() {
+        var parser = ServerSentEventParser()
+        let line = Array("data: \(String(repeating: "x", count: 1_000))\n".utf8)
+        #expect(throws: ServerSentEventParser.ParseError.frameTooLarge) {
+            for _ in 0..<2_000 { _ = try parser.consume(line) }
+        }
+    }
+
+    @Test("an unterminated line delivered in bounded chunks still errors")
+    func boundSurvivesChunking() {
+        var parser = ServerSentEventParser()
+        let chunk = Array(repeating: UInt8(ascii: "x"), count: 16 * 1024)
+        #expect(throws: ServerSentEventParser.ParseError.frameTooLarge) {
+            for _ in 0..<128 { _ = try parser.consume(chunk) }
+        }
+    }
+
+    @Test("the budget resets per frame, so a long-lived stream is not cumulative")
+    func budgetResetsBetweenFrames() throws {
+        var parser = ServerSentEventParser()
+        let frame = Array("event: version\ndata: {\"version\":1}\n\n".utf8)
+        var dispatched = 0
+        // Comfortably more total bytes than one frame is allowed.
+        for _ in 0..<50_000 { dispatched += try parser.consume(frame).count }
+        #expect(dispatched == 50_000)
+    }
+
+    @Test("a heartbeat between oversized-looking frames does not accumulate")
+    func heartbeatsResetTheBudget() throws {
+        var parser = ServerSentEventParser()
+        let almost = Array("data: \(String(repeating: "x", count: 900_000))\n\n".utf8)
+        _ = try parser.consume(almost)
+        _ = try parser.consume(Array(": hb\n\n".utf8))
+        // A second near-bound frame is fine because the first one dispatched.
+        #expect(throws: Never.self) { _ = try parser.consume(almost) }
+    }
+
     @Test("the version frame decodes, and anything else does not")
     func versionFrame() {
         #expect(VersionFrame.version(in: "{\"version\":42}") == 42)
@@ -408,6 +460,62 @@ struct NudgeTests {
 
         #expect(harness.transport.requests.count == 1)
         #expect(client.activatedVersion == 3)
+    }
+
+    @Test("a nudge that joins an explicit fetch still applies its activation policy")
+    func nudgeJoiningExplicitFetchActivates() async throws {
+        let harness = nudgeHarness(version: 1)
+        let script = StreamScript()
+        harness.transport.enqueue(stream: script.stream)
+        harness.transport.enqueue(.json(resolveBody(version: 2, ["flag": boolValue(true)])))
+        let client = harness.makeClient { $0.minimumFetchInterval = .seconds(43_200) }
+        defer { withExtendedLifetime(client) {} }
+        await settle()
+        #expect(harness.transport.requests.isEmpty)
+
+        // The in-flight request belongs to a staging-only caller. What
+        // coalesces is transport work; the nudge's activation policy is its
+        // own, and must survive being answered by someone else's request.
+        harness.transport.pause()
+        let explicit = Task { try await client.fetch() }
+        await harness.transport.waitForRequests(1)
+        script.version(2)
+        await settle()
+        harness.transport.resume()
+        try await explicit.value
+        await settle()
+
+        #expect(harness.transport.requests.count == 1)
+        #expect(client.activatedVersion == 2)
+        #expect(client.flag == true)
+    }
+
+    @Test("opting out still means a nudge on someone else's fetch only stages")
+    func nudgeJoiningExplicitFetchRespectsOptOut() async throws {
+        let harness = nudgeHarness(version: 1)
+        let script = StreamScript()
+        harness.transport.enqueue(stream: script.stream)
+        harness.transport.enqueue(.json(resolveBody(version: 2, ["flag": boolValue(true)])))
+        let client = harness.makeClient {
+            $0.minimumFetchInterval = .seconds(43_200)
+            $0.autoActivateOnNudge = false
+        }
+        defer { withExtendedLifetime(client) {} }
+        await settle()
+
+        harness.transport.pause()
+        let explicit = Task { try await client.fetch() }
+        await harness.transport.waitForRequests(1)
+        script.version(2)
+        await settle()
+        harness.transport.resume()
+        try await explicit.value
+        await settle()
+
+        #expect(harness.transport.requests.count == 1)
+        #expect(client.activatedVersion == 1)
+        #expect(client.activate() == true)
+        #expect(client.flag == true)
     }
 
     @Test("a nudge fetch bypasses the interval and resets the clock")

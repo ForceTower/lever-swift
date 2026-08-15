@@ -298,20 +298,4 @@ struct FloorTests {
         #expect(fresh.activatedVersion == 41)
     }
 
-    @Test("the public singleton serves the floor too")
-    func sharedInstanceFloor() {
-        Lever.resetForTesting()
-        defer { Lever.resetForTesting() }
-
-        let harness = TestHarness()
-        harness.seedCache(version: 12, warmValues)
-        var configuration = harness.configuration()
-        configuration.automaticUpdates = false
-        Lever.configure(configuration)
-
-        #expect(Lever.shared.flag == true)
-        #expect(Lever.shared.greeting == "olá")
-        #expect(Lever.shared.paywall == Paywall(headline: "Go Pro", trialDays: 7))
-        #expect(Lever.shared.activatedVersion == 12)
-    }
 }

@@ -300,3 +300,43 @@ struct TeardownTests {
         #expect(harness.sink.all.count == logsAtTeardown)
     }
 }
+
+
+@Suite("scheduler arithmetic (§5.1)")
+struct SchedulerArithmeticTests {
+    @Test("elapsed time saturates instead of trapping")
+    func elapsedSaturates() {
+        #expect(LeverRuntime.elapsed(from: 100, to: 400) == 300)
+        #expect(LeverRuntime.elapsed(from: 400, to: 100) == -300)
+        // Both of these overflow a plain subtraction.
+        #expect(LeverRuntime.elapsed(from: Int.min, to: Int.max) == Int.max)
+        #expect(LeverRuntime.elapsed(from: Int.max, to: Int.min) == Int.min)
+    }
+
+    @Test("a cache timestamp far in the future is a scheduling input, not a crash")
+    func farFutureTimestamp() async {
+        let harness = TestHarness()
+        harness.seedCache(version: 1, [:], fetchedAt: Int.max)
+        harness.transport.enqueue(.json(resolveBody(version: 2)))
+        let client = harness.makeClient { $0.minimumFetchInterval = .seconds(3_600) }
+        defer { withExtendedLifetime(client) {} }
+        await settle()
+
+        // "In the future" counts as passed, so one fetch rewrites it to now.
+        #expect(harness.transport.requests.count == 1)
+        #expect(client.activatedVersion == 2)
+    }
+
+    @Test("an interval too large to schedule is clamped, not trapped on")
+    func extremeInterval() async {
+        let harness = TestHarness()
+        harness.seedCache(version: 1, [:])
+        let client = harness.makeClient { $0.minimumFetchInterval = .seconds(Int.max) }
+        defer { withExtendedLifetime(client) {} }
+        await settle()
+
+        #expect(harness.sink.contains(.warn, "minimumFetchInterval clamped to 365 days"))
+        #expect(harness.clock.armedDelays == [.seconds(365 * 24 * 60 * 60)])
+        #expect(harness.transport.requests.isEmpty)
+    }
+}

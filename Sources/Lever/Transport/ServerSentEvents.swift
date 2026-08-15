@@ -23,12 +23,24 @@ struct ServerSentEventParser: Sendable {
     static let maxFrameBytes = 1 << 20
 
     private var buffer: [UInt8] = []
+    /// Bytes of the current frame already consumed out of `buffer`. Every line
+    /// counts — `data:`, `event:`, comments, `retry:`, unknown fields — because
+    /// the bound exists to stop a broken peer, and a broken peer picks the
+    /// field name.
+    private var frameBytes = 0
     private var pendingName: String?
     private var pendingData: String?
 
     init() {}
 
     mutating func consume(_ chunk: [UInt8]) throws -> [Event] {
+        // Checked before the bytes are appended, let alone turned into a
+        // `String`: a post-hoc check on what is left over would happily
+        // allocate a 100 MiB `event:` line first and find nothing wrong after
+        // consuming it (§6.2).
+        guard frameBytes + buffer.count + chunk.count <= Self.maxFrameBytes else {
+            throw ParseError.frameTooLarge
+        }
         buffer.append(contentsOf: chunk)
 
         var events: [Event] = []
@@ -46,25 +58,23 @@ struct ServerSentEventParser: Sendable {
 
             let line = Array(buffer[lineStart..<index])
             index += (byte == 0x0D && buffer[index + 1] == 0x0A) ? 2 : 1
+            frameBytes += index - lineStart
             lineStart = index
             if let event = handle(line: line) { events.append(event) }
         }
 
         buffer.removeFirst(lineStart)
-        guard buffer.count <= Self.maxFrameBytes,
-            (pendingData?.utf8.count ?? 0) <= Self.maxFrameBytes
-        else {
-            throw ParseError.frameTooLarge
-        }
         return events
     }
 
     private mutating func handle(line: [UInt8]) -> Event? {
-        // The blank line dispatches whatever has accumulated.
+        // The blank line dispatches whatever has accumulated, which is also
+        // where the frame budget resets.
         if line.isEmpty {
             defer {
                 pendingName = nil
                 pendingData = nil
+                frameBytes = 0
             }
             guard let data = pendingData else { return nil }
             return Event(name: pendingName, data: data)

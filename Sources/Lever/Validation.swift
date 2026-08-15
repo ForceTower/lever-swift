@@ -30,6 +30,7 @@ private let maxReservedLength = 64
 private let maxAttributeNameLength = 64
 private let maxAttributeValueLength = 256
 private let maxAttributes = 20
+private let maximumFetchInterval = Duration.seconds(365 * 24 * 60 * 60)
 
 /// The official semver.org grammar, the same one the server validates with
 /// (spec 0001 §4). Computed, not stored: a `Regex` is not `Sendable`, and
@@ -187,6 +188,12 @@ private func validateInterval(_ interval: Duration, sink: any LeverLogSink) -> D
         // which §5.1's hot-loop guard depends on not happening.
         sink.warn("minimumFetchInterval clamped to zero from a negative value")
         return .zero
+    }
+    // A year is already absurd for a config refresh, and past it the timer's
+    // deadline arithmetic stops fitting in the Unix seconds it is added to.
+    if interval > maximumFetchInterval {
+        sink.warn("minimumFetchInterval clamped to 365 days from a larger value")
+        return maximumFetchInterval
     }
     if interval > .zero && interval < .seconds(60) {
         sink.info("minimumFetchInterval is under the 60s polling floor — the in-session timer runs at 60s, lifecycle edges keep the configured value")

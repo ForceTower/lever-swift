@@ -364,7 +364,9 @@ struct ObservationTests {
     }
 }
 
-@Suite("the shared instance (§2.1)")
+/// Serialized: the singleton is process-global, so these tests would otherwise
+/// race each other into the configure-once trap.
+@Suite("the shared instance (§2.1)", .serialized)
 struct SharedInstanceTests {
     @Test("configure installs a client that shared returns")
     func configureAndRead() {
@@ -380,5 +382,46 @@ struct SharedInstanceTests {
         #expect(Lever.shared.flag == true)
         #expect(Lever.shared.activatedVersion == 4)
         #expect(Lever.shared === Lever.shared)
+    }
+
+    @Test("the singleton serves the three-layer floor too")
+    func sharedInstanceFloor() {
+        Lever.resetForTesting()
+        defer { Lever.resetForTesting() }
+
+        let harness = TestHarness()
+        harness.seedCache(
+            version: 12,
+            [
+                "flag": WireValue(type: "boolean", value: .bool(true)),
+                "greeting": WireValue(type: "string", value: .string("olá")),
+            ]
+        )
+        var configuration = harness.configuration()
+        configuration.automaticUpdates = false
+        Lever.configure(configuration)
+
+        #expect(Lever.shared.flag == true)
+        #expect(Lever.shared.greeting == "olá")
+        #expect(Lever.shared.activatedVersion == 12)
+    }
+
+    @Test("exactly one racing caller can reserve installation")
+    func reservationIsAtomic() async {
+        Lever.resetForTesting()
+        defer { Lever.resetForTesting() }
+
+        // Testing the reservation primitive rather than `configure` itself: the
+        // losers' documented path is a trap, which would take the test process
+        // with it.
+        let winners = await withTaskGroup(of: Bool.self) { group in
+            for _ in 0..<32 { group.addTask { Lever.reserveInstallation() } }
+            var won = 0
+            for await reserved in group where reserved { won += 1 }
+            return won
+        }
+        #expect(winners == 1)
+        // A reserved-but-not-yet-installed singleton is not readable either.
+        #expect(Lever.reserveInstallation() == false)
     }
 }

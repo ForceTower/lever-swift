@@ -27,6 +27,7 @@ public final class LeverClient: Observable, Sendable {
     let clientId: String
 
     private let cache: CacheStore
+    private let writer: SnapshotWriter
     private let registrar = ObservationRegistrar()
     private let state = Mutex(State())
     private let now: @Sendable () -> Int
@@ -46,6 +47,9 @@ public final class LeverClient: Observable, Sendable {
         var generation: UInt64 = 0
         var memo: [MemoKey: any Sendable] = [:]
         var logged: Set<LogKey> = []
+        /// Stamped under this lock on every commit, so persistence can be
+        /// replayed to disk in the order the commits actually happened.
+        var writeSequence: UInt64 = 0
         var continuations: [Int: AsyncStream<LeverUpdate>.Continuation] = [:]
         var nextContinuationID = 0
     }
@@ -77,6 +81,7 @@ public final class LeverClient: Observable, Sendable {
             keyHash: validated.cacheKeyHash,
             sink: validated.logSink
         )
+        writer = SnapshotWriter(store: cache)
 
         // Both before any `await`: the identity must exist before the first
         // fetch can send it, and the cache must be in memory before the first
@@ -216,11 +221,13 @@ public final class LeverClient: Observable, Sendable {
             state.activated = committed
             state.staged = nil
             state.generation &+= 1
+            state.writeSequence &+= 1
             // A version bump re-opens the per-version dedupe either way.
             state.logged.removeAll()
             if changed { state.memo.removeAll() }
 
             return Activation(
+                sequence: state.writeSequence,
                 snapshot: CachedSnapshot(
                     version: committed.version,
                     etag: committed.etag,
@@ -242,7 +249,7 @@ public final class LeverClient: Observable, Sendable {
 
         // A metadata-only commit still persists, so `activatedVersion` and the
         // cached snapshot track the server across value-identical publishes.
-        cache.save(outcome.snapshot)
+        writer.write(outcome.snapshot, sequence: outcome.sequence)
 
         guard let update = outcome.update else {
             configuration.logSink.debug("committed version=\(outcome.snapshot.version) changed=0")
@@ -267,6 +274,7 @@ public final class LeverClient: Observable, Sendable {
     }
 
     private struct Activation {
+        let sequence: UInt64
         let snapshot: CachedSnapshot
         let update: LeverUpdate?
         let continuations: [AsyncStream<LeverUpdate>.Continuation]
@@ -301,7 +309,7 @@ public final class LeverClient: Observable, Sendable {
     /// confirmed, which is the case that must be persisted.
     @discardableResult
     func confirmFreshness(ofStaged: Bool, at fetchedAt: Int) -> Bool {
-        let snapshot = state.withLock { state -> CachedSnapshot? in
+        let commit = state.withLock { state -> (CachedSnapshot, UInt64)? in
             if ofStaged {
                 // Staged metadata must never be combined with activated values.
                 state.staged?.fetchedAt = fetchedAt
@@ -310,18 +318,24 @@ public final class LeverClient: Observable, Sendable {
             guard var activated = state.activated else { return nil }
             activated.fetchedAt = fetchedAt
             state.activated = activated
-            return CachedSnapshot(
-                version: activated.version,
-                etag: activated.etag,
-                values: activated.values,
-                fetchedAt: fetchedAt,
-                activatedAt: activated.activatedAt ?? fetchedAt
+            state.writeSequence &+= 1
+            return (
+                CachedSnapshot(
+                    version: activated.version,
+                    etag: activated.etag,
+                    values: activated.values,
+                    fetchedAt: fetchedAt,
+                    activatedAt: activated.activatedAt ?? fetchedAt
+                ),
+                state.writeSequence
             )
         }
-        guard let snapshot else { return false }
+        guard let commit else { return false }
         // Without this write the refreshed clock is lost on relaunch and the
-        // next launch refetches inside the interval (§6.1).
-        cache.save(snapshot)
+        // next launch refetches inside the interval (§6.1). It is sequenced
+        // like any other commit, so a delayed 304 write cannot land on top of a
+        // newer activation.
+        writer.write(commit.0, sequence: commit.1)
         return true
     }
 

@@ -214,8 +214,23 @@ actor LeverRuntime {
         // The wall clock moved backwards; one fetch rewrites it to now, so this
         // cannot loop.
         if fetchedAt > now { return true }
-        return now - fetchedAt >= Int(configuration.minimumFetchInterval.components.seconds)
+        return Self.elapsed(from: fetchedAt, to: now) >= Self.seconds(of: minimumFetchInterval)
     }
+
+    /// Elapsed seconds, saturating rather than trapping. These timestamps come
+    /// from a cache file and an injectable clock, and neither is allowed to turn
+    /// into a crash — that is the corrupt-cache floor (§10.1).
+    static func elapsed(from earlier: Int, to later: Int) -> Int {
+        let (difference, overflow) = later.subtractingReportingOverflow(earlier)
+        guard overflow else { return difference }
+        return earlier < 0 ? Int.max : Int.min
+    }
+
+    static func seconds(of duration: Duration) -> Int {
+        Int(clamping: duration.components.seconds)
+    }
+
+    private var minimumFetchInterval: Duration { configuration.minimumFetchInterval }
 
     // MARK: - The in-session timer
 
@@ -237,7 +252,8 @@ actor LeverRuntime {
         let anchor =
             attemptAt ?? client?.newestRepresentation?.representation.fetchedAt
             ?? environment.now()
-        let delay = max(0, anchor + Int(armed.components.seconds) - environment.now())
+        let (deadline, overflow) = anchor.addingReportingOverflow(Self.seconds(of: armed))
+        let delay = overflow ? Int.max : max(0, Self.elapsed(from: environment.now(), to: deadline))
 
         let clock = clock
         timer = Task { [weak self] in
@@ -255,27 +271,35 @@ actor LeverRuntime {
     private func handleNudge(version: Int) {
         guard !isTornDown, let client else { return }
         guard version != client.lastKnownVersion else { return }
+        sink.debug("nudge version=\(version)")
 
         // Coalescing into the in-flight request can lose an update: the server
-        // may have chosen that response before this version was published.
-        if inFlight != nil {
-            pendingNudge = version
-            return
-        }
-        startNudgeFetch()
+        // may have chosen that response before this version was published. The
+        // announced token decides whether a *follow-up request* is needed.
+        if inFlight != nil { pendingNudge = version }
+
+        // What coalesces is transport work; the activation policy is this
+        // caller's own (§5.1). Joining the shared task here — synchronously, so
+        // it cannot slip between finishing and this hop — attaches the nudge's
+        // activation interest to whichever request actually answers it. Without
+        // it, a nudge that lands on an explicit staging-only fetch is answered
+        // by that fetch and then activated by nobody.
+        activateWhenDone(sharedFetch())
     }
 
     private func drainPendingNudge() {
         guard let pending = pendingNudge else { return }
         pendingNudge = nil
         guard !isTornDown, let client, pending != client.lastKnownVersion else { return }
-        startNudgeFetch()
+        activateWhenDone(sharedFetch())
     }
 
-    private func startNudgeFetch() {
+    /// Awaits shared transport work and applies the nudge's activation policy.
+    /// Redundant calls are harmless: `activate()` with nothing staged is a no-op.
+    private func activateWhenDone(_ task: Task<Void, any Error>) {
         Task {
             do {
-                try await self.fetch(reason: .nudge)
+                try await awaitWithoutCancelling(task)
                 if self.configuration.autoActivateOnNudge {
                     self.client?.activate()
                 }

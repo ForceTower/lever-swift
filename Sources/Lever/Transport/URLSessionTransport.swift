@@ -11,6 +11,10 @@ import Foundation
 final class URLSessionTransport: NSObject, LeverTransport, URLSessionTaskDelegate, @unchecked
     Sendable
 {
+    /// The largest chunk handed to the SSE parser. Keeps an unterminated line
+    /// bounded between the socket and the parser's frame accounting.
+    static let maxChunkBytes = 16 * 1024
+
     private let session: URLSession
 
     override init() {
@@ -53,16 +57,19 @@ final class URLSessionTransport: NSObject, LeverTransport, URLSessionTaskDelegat
             return HTTPStream(status: nil)
         }
 
-        // Chunked at line boundaries. SSE volume is a frame every 25 s, so the
-        // per-byte loop costs nothing and keeps the parser's contract honest:
-        // it must handle any chunking, and this is one plausible chunking.
+        // Chunked at line boundaries *or* at `maxChunkBytes`, whichever comes
+        // first. Flushing only on newlines would let a peer that never sends
+        // one grow this buffer without limit — below the parser, where the
+        // 1 MiB frame bound cannot see it (§6.2). SSE volume is a frame every
+        // 25 s, so the per-byte loop costs nothing.
         let chunks = AsyncThrowingStream<[UInt8], any Error> { continuation in
             let task = Task {
                 var buffer: [UInt8] = []
+                buffer.reserveCapacity(Self.maxChunkBytes)
                 do {
                     for try await byte in bytes {
                         buffer.append(byte)
-                        if byte == 0x0A {
+                        if byte == 0x0A || buffer.count >= Self.maxChunkBytes {
                             continuation.yield(buffer)
                             buffer.removeAll(keepingCapacity: true)
                         }
