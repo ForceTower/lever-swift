@@ -97,6 +97,50 @@ struct CacheStoreTests {
         #expect(cache.loadOrCreateClientId() == loaded)
     }
 
+    @Test("an identity that cannot be read is never overwritten")
+    func outOfReachIdentityIsNotDestroyed() throws {
+        let harness = TestHarness()
+        let cache = store(harness)
+        let original = cache.loadOrCreateClientId()
+        let before = try Data(contentsOf: cache.identityURL)
+
+        let manager = FileManager.default
+        let path = cache.identityURL.path
+        try manager.setAttributes([.posixPermissions: 0o000], ofItemAtPath: path)
+        defer { try? manager.setAttributes([.posixPermissions: 0o644], ofItemAtPath: path) }
+
+        // Root ignores the permission bits, so there is nothing to prove there.
+        guard (try? Data(contentsOf: cache.identityURL)) == nil else { return }
+
+        // This is Data Protection's shape on a device: the file is present and
+        // simply out of reach. Reading that as absence is what made a locked
+        // background launch mint a new identity and write it over the real one.
+        let volatileId = cache.loadOrCreateClientId()
+        #expect(UUID(uuidString: volatileId) != nil)
+        #expect(volatileId != original)
+        #expect(harness.sink.contains(.warn, "identity file could not be read"))
+
+        try manager.setAttributes([.posixPermissions: 0o644], ofItemAtPath: path)
+        let after = try Data(contentsOf: cache.identityURL)
+        #expect(after == before)
+        // The installation's real identity comes back the moment it can be read.
+        #expect(cache.loadOrCreateClientId() == original)
+    }
+
+    @Test("a corrupt identity is replaced and the replacement is stable")
+    func corruptIdentityIsReplaced() throws {
+        let harness = TestHarness()
+        let cache = store(harness)
+        _ = cache.loadOrCreateClientId()
+
+        try Data("not json".utf8).write(to: cache.identityURL)
+        let regenerated = cache.loadOrCreateClientId()
+        #expect(UUID(uuidString: regenerated) != nil)
+        // Bytes that are not an identity are the one case where replacing the
+        // file is right — and the replacement has to survive the next launch.
+        #expect(cache.loadOrCreateClientId() == regenerated)
+    }
+
     @Test("out-of-range timestamps are corrupt, not a scheduling input")
     func rejectsOutOfRangeTimestamps() throws {
         let harness = TestHarness()

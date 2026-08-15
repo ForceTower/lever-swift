@@ -40,37 +40,83 @@ struct CacheStore: Sendable {
     func loadOrCreateClientId() -> String {
         createDirectory()
 
-        if let existing = readIdentity() { return existing }
+        let existing = readIdentity()
+        switch existing {
+        case .found(let clientId):
+            return clientId
+        case .outOfReach:
+            // Data Protection, almost always: the file is there and will be
+            // readable again once the device is unlocked. Minting a replacement
+            // is wrong and *persisting* one would destroy the installation's
+            // real identity, so this id is deliberately volatile — it lasts for
+            // this launch and touches nothing on disk.
+            sink.warn("identity file could not be read — using a volatile client id for this launch")
+            return UUID().uuidString.lowercased()
+        case .absent, .unusable:
+            break
+        }
 
         let generated = UUID().uuidString.lowercased()
         let payload = IdentityFile(schemaVersion: Self.schemaVersion, clientId: generated)
         guard let data = try? JSONEncoder.lever.encode(payload) else { return generated }
 
+        // Bytes that parsed but are not an identity are not someone else's
+        // identity either, so there is nothing to lose by replacing them.
+        if case .unusable = existing { return overwriteIdentity(generated) }
+
         switch exclusivelyCreate(identityURL, data: data) {
         case .created:
             return generated
         case .alreadyExists:
-            // Someone else won; their identity is the one on disk.
-            return readIdentity() ?? overwriteIdentity(generated)
+            // Someone else won between the read and the link; their identity is
+            // the one on disk. Overwriting is safe only when the re-read proves
+            // the file unusable — never when it merely could not be read.
+            switch readIdentity() {
+            case .found(let clientId): return clientId
+            case .unusable: return overwriteIdentity(generated)
+            case .absent, .outOfReach: return generated
+            }
         case .failed(let message):
             sink.error("client id could not be persisted error=\(message)")
+            // Nothing was published, so a readable file can only be someone
+            // else's — preferring it keeps a failed write from minting a second
+            // identity for an installation that already has one.
+            if case .found(let clientId) = readIdentity() { return clientId }
             return generated
         }
     }
 
-    private func readIdentity() -> String? {
-        guard let data = try? Data(contentsOf: identityURL) else { return nil }
+    /// Why absence and unreadability are not the same answer: collapsing them
+    /// makes a locked device look like a first run, and the first run path both
+    /// mints a new identity *and* writes it over the one already there.
+    private enum IdentityRead {
+        case found(String)
+        /// No file — a genuine first run.
+        case absent
+        /// A file that cannot be read *right now*. Never a reason to write.
+        case outOfReach
+        /// Read, but not an identity: wrong schema, bad JSON, not a uuid.
+        case unusable
+    }
+
+    private func readIdentity() -> IdentityRead {
+        let data: Data
+        do {
+            data = try Data(contentsOf: identityURL)
+        } catch {
+            return isFileNotFound(error) ? .absent : .outOfReach
+        }
         guard let file = try? JSONDecoder().decode(IdentityFile.self, from: data),
             file.schemaVersion == Self.schemaVersion
         else {
             sink.warn("identity file is unreadable — regenerating the client id")
-            return nil
+            return .unusable
         }
         // §7 defines the persisted identity as a lowercase UUID, and spec 0001
         // §6.2 caps clientId at 64 chars, so anything unparseable is corrupt.
         guard let uuid = UUID(uuidString: file.clientId) else {
             sink.warn("client id is not a uuid — regenerating")
-            return nil
+            return .unusable
         }
         let canonical = uuid.uuidString.lowercased()
         guard canonical == file.clientId else {
@@ -79,9 +125,21 @@ struct CacheStore: Sendable {
             // a cache directory that each regenerated on the other's casing
             // would reshuffle every percentage rollout forever.
             sink.warn("client id was not canonical — rewriting it lowercase")
-            return overwriteIdentity(canonical)
+            return .found(overwriteIdentity(canonical))
         }
-        return file.clientId
+        return .found(file.clientId)
+    }
+
+    private func isFileNotFound(_ error: Error) -> Bool {
+        let error = error as NSError
+        switch error.domain {
+        case NSCocoaErrorDomain:
+            return error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError
+        case NSPOSIXErrorDomain:
+            return error.code == Int(ENOENT)
+        default:
+            return false
+        }
     }
 
     @discardableResult
@@ -159,9 +217,24 @@ struct CacheStore: Sendable {
         }
     }
 
+    /// `.atomic`, plus an explicit protection class on the platforms that have
+    /// one. Left to inherit, these files take whatever the host app made its
+    /// default — and an app that opts into complete protection would make them
+    /// unreadable whenever the device is locked, which is exactly when a
+    /// background launch reads them. Until-first-unlock is the platform's own
+    /// default for app data: it survives a locked device without asking for
+    /// weaker protection than the app already chose for everything else.
+    private var writingOptions: Data.WritingOptions {
+        #if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
+            return [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
+        #else
+            return [.atomic]
+        #endif
+    }
+
     private func write(_ data: Data, to url: URL, what: String) {
         do {
-            try data.write(to: url, options: .atomic)
+            try data.write(to: url, options: writingOptions)
         } catch {
             sink.error("\(what) write failed error=\(error.localizedDescription)")
         }
@@ -183,7 +256,9 @@ struct CacheStore: Sendable {
     private func exclusivelyCreate(_ url: URL, data: Data) -> ExclusiveCreate {
         let temporary = directory.appendingPathComponent(".identity-\(UUID().uuidString).tmp")
         do {
-            try data.write(to: temporary, options: .atomic)
+            // The link shares the temporary's inode, so the protection class
+            // set here is the one identity.json ends up carrying.
+            try data.write(to: temporary, options: writingOptions)
         } catch {
             return .failed(error.localizedDescription)
         }
