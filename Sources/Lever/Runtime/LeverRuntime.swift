@@ -41,13 +41,13 @@ actor LeverRuntime {
     private var streamTask: Task<Void, Never>?
     private var streamPump: Task<Void, Never>?
     private var watchdog: Task<Void, Never>?
-    private var initialFetch: Task<Void, Never>?
 
     /// The latest differing announced version seen while a fetch was already in
     /// flight. Last one wins — versions are identity tokens, never `max`ed
     /// (§5.3).
     private var pendingNudge: Int?
     private var foregrounded = false
+    private var sawInitialPhase = false
     /// A 401 on the stream stops reconnecting until the next foreground (§6.2).
     private var streamStopped = false
     private var isTornDown = false
@@ -74,11 +74,6 @@ actor LeverRuntime {
         // here starts — no fetch, timer, lifecycle observer, or stream (§5).
         guard configuration.automaticUpdates else { return }
 
-        // §5.1's "on init, run the automatic fetch path", independent of the
-        // lifecycle phase. A foreground event arriving right behind it coalesces
-        // into the same request rather than issuing a second one.
-        initialFetch = Task { await self.runAutomaticFetch() }
-
         let source = environment.lifecycle()
         lifecycleTask = Task { [weak self] in
             for await phase in source.phases() {
@@ -94,7 +89,6 @@ actor LeverRuntime {
     private func stop() {
         isTornDown = true
         inFlight?.cancel()
-        initialFetch?.cancel()
         timer?.cancel()
         lifecycleTask?.cancel()
         streamTask?.cancel()
@@ -110,6 +104,13 @@ actor LeverRuntime {
 
     private func handle(phase: LeverLifecyclePhase) {
         guard !isTornDown else { return }
+        // The source reports the current phase at subscription, so the first
+        // event *is* §5.1's "on init, run the automatic fetch path" — including
+        // for a client born backgrounded. Running it separately would issue two
+        // requests at launch whenever the first one failed.
+        let isFirstPhase = !sawInitialPhase
+        sawInitialPhase = true
+
         switch phase {
         case .foreground:
             foregrounded = true
@@ -121,6 +122,7 @@ actor LeverRuntime {
             timer?.cancel()
             timer = nil
             disconnectStream()
+            if isFirstPhase { Task { await self.runAutomaticFetch() } }
         }
     }
 
@@ -313,23 +315,27 @@ actor LeverRuntime {
     private func runStream() async {
         var attempt = 0
         while !Task.isCancelled, foregrounded, !streamStopped, !isTornDown {
-            let round = await connectOnce()
-            switch round {
+            var retryAfter: Double?
+            switch await connectOnce() {
             case .stop:
                 return
             case .active:
+                // A connection that opened and delivered a frame earns a fresh
+                // backoff budget — but still a delay, or a server that closes
+                // right after the connect frame becomes a reconnect hot loop.
                 attempt = 0
-                continue
-            case .failed(let retryAfter):
-                // Full jitter over an exponential ceiling (§6.2).
-                let ceiling = min(60, pow(2, Double(attempt)))
-                let delay = max(retryAfter ?? 0, environment.jitter(ceiling))
-                attempt += 1
-                do {
-                    try await clock.sleep(for: .seconds(delay))
-                } catch {
-                    return
-                }
+            case .failed(let floor):
+                retryAfter = floor
+            }
+
+            // Full jitter over an exponential ceiling (§6.2).
+            let ceiling = min(60, pow(2, Double(attempt)))
+            let delay = max(retryAfter ?? 0, environment.jitter(ceiling))
+            attempt += 1
+            do {
+                try await clock.sleep(for: .seconds(delay))
+            } catch {
+                return
             }
         }
     }

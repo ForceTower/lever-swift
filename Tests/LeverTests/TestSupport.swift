@@ -253,7 +253,11 @@ struct StreamScript: Sendable {
     let stream: HTTPStream
     private let continuation: AsyncThrowingStream<[UInt8], any Error>.Continuation
 
-    init(status: Int = 200, contentType: String? = "text/event-stream", retryAfter: String? = nil) {
+    init(
+        status: Int? = 200,
+        contentType: String? = "text/event-stream",
+        retryAfter: String? = nil
+    ) {
         let (bytes, continuation) = AsyncThrowingStream<[UInt8], any Error>.makeStream()
         var headers = HTTPHeaders()
         if let contentType { headers["Content-Type"] = contentType }
@@ -365,12 +369,25 @@ final class TestHarness: Sendable {
 
     var now: Int { wallClock.current }
 
+    /// Armed delays at stream scale — backoff tops out at 60 s and a
+    /// `Retry-After` floor at 300 s, so this excludes the in-session fetch
+    /// timer without the test having to know what interval it configured.
+    var backoffDelays: [Duration] { clock.armedDelays.filter { $0 <= .seconds(300) } }
+
     func advanceWallClock(by seconds: Int) {
         wallClock.mutate { $0 += seconds }
     }
 
     func setWallClock(to seconds: Int) {
         wallClock.set(seconds)
+    }
+
+    /// Moves both clocks together, the way real time does. Tests that want to
+    /// prove the timer is immune to wall-clock jumps move only one.
+    func advance(by seconds: Int) async {
+        advanceWallClock(by: seconds)
+        clock.advance(by: .seconds(seconds))
+        await settle()
     }
 
     /// The next backoff draw, as a fraction of the ceiling.
