@@ -120,6 +120,19 @@ public final class LeverClient: Observable, Sendable {
     /// collide with a real member (`fetch`, `updates`, …) — real members always
     /// win over dynamic ones (§2.2).
     public func value<Value>(for key: LeverKey<Value>) -> Value {
+        lookup(key) ?? key.defaultValue
+    }
+
+    /// The same read, reporting absence instead of absorbing it: `nil` means
+    /// this environment has no value the key can serve — not published, or
+    /// present but unreadable as `Value` (§2.3).
+    ///
+    /// It exists for one caller: a composite that layers lever over another
+    /// config source. `value(for:)` commits to the code default the moment
+    /// lever is silent, which would shadow every lower layer; `lookup` lets the
+    /// caller fall through and keep the code default as the floor under *all*
+    /// of them.
+    public func lookup<Value>(_ key: LeverKey<Value>) -> Value? {
         registrar.access(self, keyPath: \.observedSnapshot)
 
         let memoKey = MemoKey(name: key.name, valueType: key.valueType)
@@ -155,7 +168,7 @@ public final class LeverClient: Observable, Sendable {
                 level: .debug,
                 message: "key absent key=\(key.name)"
             )
-            return key.defaultValue
+            return nil
 
         case .mismatch:
             logOnce(
@@ -164,7 +177,7 @@ public final class LeverClient: Observable, Sendable {
                 message:
                     "type mismatch key=\(key.name) wire=\(raw?.type ?? "none") as=\(Value.self)"
             )
-            return key.defaultValue
+            return nil
         }
     }
 

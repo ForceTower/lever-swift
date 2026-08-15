@@ -257,6 +257,56 @@ struct ReadTests {
         _ = client.activate()
         #expect(client.paywall.headline == "Two")
     }
+
+    @Test("lookup reports absence instead of serving the default")
+    func lookupReportsAbsence() {
+        let harness = TestHarness()
+        let client = harness.makeClient { $0.automaticUpdates = false }
+        let keys = LeverKeys()
+
+        #expect(client.lookup(keys.flag) == nil)
+        #expect(client.flag == false)
+
+        client.stage(representation(version: 1, flagOff))
+        _ = client.activate()
+        // A published `false` is a value, not an absence — the distinction a
+        // default-serving read cannot express.
+        #expect(client.lookup(keys.flag) == false)
+    }
+
+    @Test("lookup reports a mismatch as absence")
+    func lookupReportsMismatch() {
+        let harness = TestHarness()
+        let client = harness.makeClient { $0.automaticUpdates = false }
+        client.stage(
+            representation(version: 1, ["flag": WireValue(type: "string", value: .string("x"))])
+        )
+        _ = client.activate()
+
+        #expect(client.lookup(LeverKeys().flag) == nil)
+        #expect(harness.sink.count(.warn, containing: "type mismatch key=flag") == 1)
+    }
+
+    @Test("lookup resolves json keys through the same memo")
+    func lookupUsesTheMemo() {
+        let harness = TestHarness()
+        let client = harness.makeClient { $0.automaticUpdates = false }
+        client.stage(
+            representation(
+                version: 1,
+                [
+                    "paywall": WireValue(
+                        type: "json",
+                        value: .object(["headline": .string("Go Pro"), "trialDays": .int(7)])
+                    )
+                ]
+            )
+        )
+        _ = client.activate()
+
+        #expect(client.lookup(LeverKeys().paywall) == Paywall(headline: "Go Pro", trialDays: 7))
+        #expect(client.paywall == Paywall(headline: "Go Pro", trialDays: 7))
+    }
 }
 
 @Suite("observation and updates (§4.1)")
