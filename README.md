@@ -13,7 +13,7 @@ remote config service. Zero dependencies, one product, five platforms.
 ## Install
 
 ```swift
-.package(url: "https://github.com/ForceTower/lever-swift.git", from: "0.1.0")
+.package(url: "https://github.com/ForceTower/lever-swift.git", from: "0.1.1")
 ```
 
 Requires Swift 6, iOS 18 / macOS 15 / watchOS 11 / tvOS 18 / visionOS 2.
