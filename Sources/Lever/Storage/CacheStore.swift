@@ -156,22 +156,30 @@ struct CacheStore: Sendable {
         case failed(String)
     }
 
+    /// Write-then-`link`, not `O_CREAT | O_EXCL` on the destination.
+    ///
+    /// An exclusive create publishes the *name* before the bytes, so a racing
+    /// reader can find an empty file, decide it is corrupt, and overwrite the
+    /// winner's identity with its own. `link` publishes a fully written file in
+    /// one atomic step, which makes "the file exists" mean "the file is
+    /// complete" — the property the loser's re-read depends on (§7).
     private func exclusivelyCreate(_ url: URL, data: Data) -> ExclusiveCreate {
-        let descriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
-            guard let path else { return -1 }
-            return open(path, O_CREAT | O_EXCL | O_WRONLY, 0o644)
-        }
-        if descriptor < 0 {
-            return errno == EEXIST ? .alreadyExists : .failed(String(cString: strerror(errno)))
-        }
-        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        let temporary = directory.appendingPathComponent(".identity-\(UUID().uuidString).tmp")
         do {
-            try handle.write(contentsOf: data)
-            try handle.close()
-            return .created
+            try data.write(to: temporary, options: .atomic)
         } catch {
             return .failed(error.localizedDescription)
         }
+        defer { try? FileManager.default.removeItem(at: temporary) }
+
+        let linked = temporary.withUnsafeFileSystemRepresentation { source -> Int32 in
+            url.withUnsafeFileSystemRepresentation { destination -> Int32 in
+                guard let source, let destination else { return -1 }
+                return link(source, destination)
+            }
+        }
+        if linked == 0 { return .created }
+        return errno == EEXIST ? .alreadyExists : .failed(String(cString: strerror(errno)))
     }
 }
 
@@ -182,8 +190,9 @@ private struct IdentityFile: Codable {
     let clientId: String
 }
 
-/// All fields are required except `etag` — the file exists only once something
-/// has been activated, so there is no half-empty state to represent (§7).
+/// All fields are required except `etag`, which is nullable — the file exists
+/// only once something has been activated, so there is no half-empty state to
+/// represent (§7).
 private struct SnapshotFile: Codable {
     let schemaVersion: Int
     let version: Int
@@ -191,6 +200,19 @@ private struct SnapshotFile: Codable {
     let values: [String: WireValue]
     let fetchedAt: Int
     let activatedAt: Int
+
+    /// `etag` is written as an explicit `null` rather than omitted, so every
+    /// snapshot file has the same key set whatever produced it — the format
+    /// fixtures other SDKs read stay one shape.
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(version, forKey: .version)
+        try container.encode(etag, forKey: .etag)
+        try container.encode(values, forKey: .values)
+        try container.encode(fetchedAt, forKey: .fetchedAt)
+        try container.encode(activatedAt, forKey: .activatedAt)
+    }
 }
 
 extension JSONEncoder {
