@@ -166,7 +166,20 @@ actor LeverRuntime {
         }
 
         let fetchedAt = environment.now()
-        switch try ResolveEndpoint.outcome(for: response, sentValidator: validator != nil) {
+        let resolved: ResolveEndpoint.Outcome
+        do {
+            resolved = try ResolveEndpoint.outcome(for: response, sentValidator: validator != nil)
+        } catch {
+            // The envelope's `error.code` says *why* a reachable server refused,
+            // which the status alone does not. Logged, never branched on — the
+            // thrown error already carries the branch (spec 0001 §5.1).
+            if let code = ResolveEndpoint.errorCode(for: response) {
+                sink.warn("resolve refused code=\(code)")
+            }
+            throw error
+        }
+
+        switch resolved {
         case .fresh(let version, let values, let etag):
             client.stage(
                 Representation(

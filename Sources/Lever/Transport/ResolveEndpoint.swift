@@ -57,12 +57,31 @@ enum ResolveEndpoint {
         )
     }
 
-    /// The §6.1 body: `version` must be a non-negative integer representable as
-    /// `Int`. Any shape violation is `invalidResponse`, and the caller changes
-    /// nothing — decode failure is atomic.
+    /// The spec 0001 §5.1 envelope. `message` is deliberately not decoded: it
+    /// is explicitly non-contractual, so nothing here may branch on it.
+    private struct Envelope: Decodable {
+        let ok: Bool
+        let data: Payload?
+        let error: ErrorBody?
+    }
+
+    private struct ErrorBody: Decodable {
+        let code: String?
+    }
+
+    /// The §6.3 payload, one level below the envelope: `version` must be a
+    /// non-negative integer representable as `Int`. Any shape violation is
+    /// `invalidResponse`, and the caller changes nothing — decode is atomic.
     private struct Payload: Decodable {
         let version: Int
         let values: [String: WireValue]
+    }
+
+    /// The `error.code` a failure envelope carried, for the log line only —
+    /// never for control flow; the status code already carries the branch
+    /// (spec 0001 §5.1).
+    static func errorCode(for response: HTTPResponse) -> String? {
+        (try? JSONDecoder().decode(Envelope.self, from: response.body))?.error?.code
     }
 
     enum Outcome: Sendable {
@@ -78,7 +97,14 @@ enum ResolveEndpoint {
 
         switch status {
         case 200:
-            guard let payload = try? JSONDecoder().decode(Payload.self, from: response.body),
+            // `ok: false`, or a null/absent `data`, is a fetch failure —
+            // **never** an empty `values` map. Treating it as empty would
+            // resolve every key to its code default while the previous snapshot
+            // was still perfectly serviceable, silently collapsing the
+            // three-layer floor on a server that was reachable (research §4.4).
+            guard let envelope = try? JSONDecoder().decode(Envelope.self, from: response.body),
+                envelope.ok,
+                let payload = envelope.data,
                 payload.version >= 0
             else { throw LeverError.invalidResponse }
             // A 200 with no ETag is accepted; later requests simply send no

@@ -125,14 +125,36 @@ struct ResolveResponseTests {
         #expect(values.isEmpty)
     }
 
-    @Test("any shape violation in the body is invalidResponse")
-    func invalidBodies() {
-        let bodies = [
+    @Test("any shape violation in the payload is invalidResponse")
+    func invalidPayloads() {
+        let payloads = [
             "{\"version\":-1,\"values\":{}}",
             "{\"version\":1.5,\"values\":{}}",
             "{\"version\":\"1\",\"values\":{}}",
             "{\"values\":{}}",
             "{\"version\":1}",
+        ]
+        for payload in payloads {
+            #expect(throws: LeverError.invalidResponse) {
+                try outcome(.json(successEnvelope(payload)))
+            }
+        }
+    }
+
+    @Test("any shape violation in the envelope is invalidResponse")
+    func invalidEnvelopes() {
+        let bodies = [
+            // A well-formed payload that never got wrapped: the envelope is the
+            // contract now, so an unwrapped body is not a valid response.
+            resolvePayload(version: 1),
+            // `ok: false` with a payload present must still be refused.
+            "{\"ok\":false,\"message\":\"n\",\"data\":{\"version\":1,\"values\":{}},\"error\":{\"code\":\"internal_error\"}}",
+            // Absent and null `data` — the cases that must never read as "no
+            // values", which would collapse the floor on a reachable server.
+            "{\"ok\":true,\"message\":\"x\",\"error\":null}",
+            "{\"ok\":true,\"message\":\"x\",\"data\":null,\"error\":null}",
+            // No `ok` at all.
+            "{\"message\":\"x\",\"data\":{\"version\":1,\"values\":{}},\"error\":null}",
             "not json",
             "",
         ]
@@ -141,6 +163,29 @@ struct ResolveResponseTests {
                 try outcome(.json(body))
             }
         }
+    }
+
+    @Test("a failure envelope surfaces its error code for logging only")
+    func failureEnvelopeErrorCode() {
+        let body =
+            "{\"ok\":false,\"message\":\"n\",\"data\":null,\"error\":{\"code\":\"invalid_key\"}}"
+        #expect(ResolveEndpoint.errorCode(for: .json(body)) == "invalid_key")
+        #expect(ResolveEndpoint.errorCode(for: .json(resolveBody(version: 1))) == nil)
+        #expect(ResolveEndpoint.errorCode(for: .json("not json")) == nil)
+    }
+
+    /// `message` is explicitly non-contractual (spec 0001 §5.1) — a server that
+    /// rewords it must not change what the SDK decodes.
+    @Test("the message is ignored entirely")
+    func messageIsIgnored() throws {
+        let payload = resolvePayload(version: 4, ["flag": boolValue(true)])
+        let reworded = "{\"ok\":true,\"message\":\"something else\",\"data\":\(payload),\"error\":null}"
+        guard case .fresh(let version, let values, _) = try outcome(.json(reworded)) else {
+            Issue.record("expected a fresh outcome")
+            return
+        }
+        #expect(version == 4)
+        #expect(values["flag"] == WireValue(type: "boolean", value: .bool(true)))
     }
 
     @Test("304 requires that we asked; unsolicited is invalidResponse")
@@ -256,6 +301,21 @@ struct ClientFetchTests {
         #expect(client.flag == false)
     }
 
+    /// The status alone does not say *why* a reachable server refused; the
+    /// envelope's code does, and it belongs in the log and nowhere else.
+    @Test("a refusal logs the envelope's error code")
+    func refusalLogsErrorCode() async throws {
+        let harness = TestHarness()
+        let client = client(harness)
+        harness.transport.enqueue(
+            .json(
+                "{\"ok\":false,\"message\":\"n\",\"data\":null,\"error\":{\"code\":\"nothing_to_publish\"}}"
+            )
+        )
+        await #expect(throws: LeverError.invalidResponse) { try await client.fetch() }
+        #expect(harness.sink.contains(.warn, "resolve refused code=nothing_to_publish"))
+    }
+
     @Test("an invalid 200 body changes nothing at all")
     func invalidBodyIsAtomic() async throws {
         let harness = TestHarness()
@@ -267,7 +327,15 @@ struct ClientFetchTests {
         _ = client.activate()
         let before = harness.cacheStore().loadSnapshot()
 
-        harness.transport.enqueue(.json("{\"version\":\"nope\"}", etag: "\"two\""))
+        // A well-formed *failure* envelope: the atomicity that matters is that a
+        // reachable server saying "no" leaves the previous snapshot serving,
+        // rather than staging an empty one.
+        harness.transport.enqueue(
+            .json(
+                "{\"ok\":false,\"message\":\"n\",\"data\":null,\"error\":{\"code\":\"internal_error\"}}",
+                etag: "\"two\""
+            )
+        )
         await #expect(throws: LeverError.invalidResponse) { try await client.fetch() }
 
         #expect(client.activatedVersion == 1)

@@ -476,9 +476,22 @@ func settle(_ turns: Int = 8) async {
 
 // MARK: - Payload helpers
 
-func resolveBody(version: Int, _ values: [String: String] = [:]) -> String {
+/// Wraps a payload in a success envelope (spec 0001 §5.1) — what the server
+/// actually sends. `message` is non-contractual, so its wording is arbitrary
+/// here on purpose: nothing in the SDK may read it.
+func successEnvelope(_ payload: String) -> String {
+    "{\"ok\":true,\"message\":\"Configuration resolved\",\"data\":\(payload),\"error\":null}"
+}
+
+/// The resolve payload alone, without the envelope — for the cases that assert
+/// an unwrapped body is rejected.
+func resolvePayload(version: Int, _ values: [String: String] = [:]) -> String {
     let entries = values.keys.sorted().map { "\"\($0)\":\(values[$0] ?? "null")" }
     return "{\"version\":\(version),\"values\":{\(entries.joined(separator: ","))}}"
+}
+
+func resolveBody(version: Int, _ values: [String: String] = [:]) -> String {
+    successEnvelope(resolvePayload(version: version, values))
 }
 
 func boolValue(_ value: Bool) -> String { "{\"type\":\"boolean\",\"value\":\(value)}" }
